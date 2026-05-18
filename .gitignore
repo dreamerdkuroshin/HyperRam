@@ -1,0 +1,21 @@
+# Environments
+venv/
+env/
+.env
+
+# Node
+node_modules/
+dist/
+build/
+
+# HyperRAM Specific Data (DO NOT PUSH)
+*.pool
+hyperram.pool
+
+# Python
+__pycache__/
+*.pyc
+
+# IDEs
+.vscode/
+.idea/

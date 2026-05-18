@@ -1,21 +1,6 @@
-# Environments
-venv/
-env/
+hyperram-daemon/venv/
+hyperram-daemon/hyperram.pool
+hyperram-daemon/__pycache__/
+hyperram-ui/node_modules/
+hyperram-ui/dist/
 .env
-
-# Node
-node_modules/
-dist/
-build/
-
-# HyperRAM Specific Data (DO NOT PUSH)
-*.pool
-hyperram.pool
-
-# Python
-__pycache__/
-*.pyc
-
-# IDEs
-.vscode/
-.idea/

@@ -3,7 +3,8 @@ import json
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import psutil
-from core import HyperRAMEngine
+import random
+from core import HyperRAMEngine, QoSTag
 
 app = FastAPI()
 
@@ -15,34 +16,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize the Engine (16GB Virtual RAM pool)
-# In a real environment, this would be a singleton that handles OS-level hooks.
 engine = HyperRAMEngine(pool_size_gb=16)
 
-# Background task to simulate workload
-async def simulate_workload():
-    import random
+async def simulate_gaming_workload():
+    tags = [QoSTag.PHYSICS, QoSTag.STATE, QoSTag.TEXTURE, QoSTag.SHADER, QoSTag.AI]
+    # Weighted random choices: Textures are read heavy, Physics is write heavy, Shaders are write-once
     while True:
-        # Simulate an application writing/reading pages
-        page = random.randint(0, 100000)
-        action = random.choice(["read", "write"])
-        if action == "write":
-            engine.write_page(page, b"A" * 4096)
-        else:
-            engine.read_page(page)
+        tag = random.choices(
+            tags, 
+            weights=[30, 20, 40, 5, 5], 
+            k=1
+        )[0]
         
-        await asyncio.sleep(0.005) # Super fast simulation
+        # Keep physics in a specific page range
+        if tag == QoSTag.PHYSICS:
+            page = random.randint(0, 100)
+            engine.write_page(page, b"P" * 4096, tag)
+        elif tag == QoSTag.TEXTURE:
+            page = random.randint(10000, 50000)
+            engine.read_page(page)
+            engine.write_page(page, b"T" * 4096, tag) # Simulate loading texture
+        elif tag == QoSTag.SHADER:
+            page = random.randint(50000, 60000)
+            engine.write_page(page, b"S" * 4096, tag)
+        elif tag == QoSTag.AI:
+            page = random.randint(60000, 70000)
+            action = random.choice(["read", "write"])
+            if action == "write":
+                engine.write_page(page, b"A" * 4096, tag)
+            else:
+                engine.read_page(page)
+        else:
+            page = random.randint(100, 1000)
+            engine.write_page(page, b"S" * 4096, tag)
+            
+        await asyncio.sleep(0.001)
 
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(simulate_workload())
+    asyncio.create_task(simulate_gaming_workload())
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
-            # Gather metrics
             sys_mem = psutil.virtual_memory()
             hyper_metrics = engine.get_metrics()
             
@@ -55,11 +73,13 @@ async def websocket_endpoint(websocket: WebSocket):
                 "hyperram_compression": hyper_metrics["compression_ratio"],
                 "hyperram_effective_latency": hyper_metrics["effective_latency_ns"],
                 "ssd_writes": hyper_metrics["ssd_writes"],
-                "ssd_reads": hyper_metrics["ssd_reads"]
+                "ssd_reads": hyper_metrics["ssd_reads"],
+                "pinned_pages": hyper_metrics["pinned_pages"],
+                "qos_traffic": hyper_metrics["qos_traffic"]
             }
             
             await websocket.send_text(json.dumps(payload))
-            await asyncio.sleep(0.5) # update twice a second
+            await asyncio.sleep(0.2)
             
     except WebSocketDisconnect:
         print("Client disconnected")

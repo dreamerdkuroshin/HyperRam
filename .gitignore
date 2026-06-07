@@ -4,3 +4,17 @@ hyperram-daemon/__pycache__/
 hyperram-ui/node_modules/
 hyperram-ui/dist/
 .env
+
+# Preserve all raw benchmark data
+!results/
+!results/**/*.csv
+!results/**/*.log
+!results/README.md
+
+# Preserve figures
+!results/figures/
+!results/figures/*.png
+
+# Preserve main pool (large binary — commit only if needed)
+# hyperram.pool is excluded above; .meta.json is small, keep it:
+!hyperram.pool.meta.json

@@ -1,0 +1,10 @@
+workload,cache_gb,logical_writes,ssd_writes,write_amp,compress_ratio
+Sequential,1.0,2000,0,0.0000,1.0000
+Sequential,0.5,2000,0,0.0000,1.0000
+Sequential,0.125,2000,0,0.0000,1.0000
+Repeated hot 10%,1.0,2000,0,0.0000,1.0000
+Repeated hot 10%,0.5,2000,0,0.0000,1.0000
+Repeated hot 10%,0.125,2000,0,0.0000,1.0000
+Pure random,1.0,2000,0,0.0000,1.0000
+Pure random,0.5,2000,0,0.0000,1.0000
+Pure random,0.125,2000,0,0.0000,1.0000

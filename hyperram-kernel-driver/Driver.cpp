@@ -50,7 +50,7 @@ typedef struct _PAGE_ENTRY {
 } PAGE_ENTRY, *PPAGE_ENTRY;
 
 typedef struct _DRIVER_CONTEXT {
-    PVOID          SsdPoolBuffer;
+    HANDLE         PoolFileHandle;  // Real SSD pool file handle
     PVOID          RamCacheBuffer;
     PPAGE_ENTRY    PageTable;
     KSPIN_LOCK     Lock;
@@ -164,22 +164,50 @@ extern "C" NTSTATUS NTAPI DriverEntry(
     g_Context->InterArrivalTauUs = 10000; // 10ms default
     g_Context->LastStride = 1;
 
-    // --- Allocate SSD / RAM / PageTable buffers ---
-    g_Context->SsdPoolBuffer  = ExAllocatePoolWithTag(NonPagedPoolNx, SSD_POOL_SIZE,  POOL_TAG);
+    // --- Allocate RAM / PageTable buffers ---
     g_Context->RamCacheBuffer = ExAllocatePoolWithTag(NonPagedPoolNx, RAM_CACHE_SIZE, POOL_TAG);
     g_Context->PageTable      = (PPAGE_ENTRY)ExAllocatePoolWithTag(
         NonPagedPoolNx, sizeof(PAGE_ENTRY) * MAX_SSD_PAGES, POOL_TAG);
 
-    if (!g_Context->SsdPoolBuffer || !g_Context->RamCacheBuffer || !g_Context->PageTable) {
+    if (!g_Context->RamCacheBuffer || !g_Context->PageTable) {
         WriteLog("[HyperRAM] Buffer alloc failed!\r\n");
         goto Cleanup;
     }
 
-    RtlZeroMemory(g_Context->SsdPoolBuffer,  SSD_POOL_SIZE);
     RtlZeroMemory(g_Context->RamCacheBuffer, RAM_CACHE_SIZE);
     RtlZeroMemory(g_Context->PageTable, sizeof(PAGE_ENTRY) * MAX_SSD_PAGES);
     for (ULONG i = 0; i < MAX_SSD_PAGES; i++)
         g_Context->PageTable[i].PageId = (ULONG64)-1;
+
+    // --- Open/Create Real SSD Pool File ---
+    UNICODE_STRING poolPath;
+    OBJECT_ATTRIBUTES poolOa;
+    IO_STATUS_BLOCK poolIsb;
+    RtlInitUnicodeString(&poolPath, L"\\??\\C:\\hyperram.pool");
+    InitializeObjectAttributes(&poolOa, &poolPath,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    status = ZwCreateFile(&g_Context->PoolFileHandle,
+        GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
+        &poolOa, &poolIsb, NULL,
+        FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_OPEN_IF,
+        FILE_SYNCHRONOUS_IO_NONALERT,
+        NULL, 0);
+
+    if (!NT_SUCCESS(status)) {
+        WriteLog("[HyperRAM] Failed to open/create SSD pool file C:\\hyperram.pool!\r\n");
+        goto Cleanup;
+    }
+
+    // Set end-of-file size to pool capacity if new or smaller
+    FILE_END_OF_FILE_INFORMATION eofInfo;
+    eofInfo.EndOfFile.QuadPart = SSD_POOL_SIZE;
+    status = ZwSetInformationFile(g_Context->PoolFileHandle, &poolIsb, &eofInfo, sizeof(eofInfo), FileEndOfFileInformation);
+    if (!NT_SUCCESS(status)) {
+        WriteLog("[HyperRAM] Warning: failed to set pool file EOF size.\r\n");
+    }
 
     // --- Spin lock ---
     KeInitializeSpinLock(&g_Context->Lock);
@@ -229,7 +257,7 @@ extern "C" NTSTATUS NTAPI DriverEntry(
 
 Cleanup:
     if (g_Context) {
-        if (g_Context->SsdPoolBuffer)  ExFreePoolWithTag(g_Context->SsdPoolBuffer,  POOL_TAG);
+        if (g_Context->PoolFileHandle) ZwClose(g_Context->PoolFileHandle);
         if (g_Context->RamCacheBuffer) ExFreePoolWithTag(g_Context->RamCacheBuffer, POOL_TAG);
         if (g_Context->PageTable)      ExFreePoolWithTag(g_Context->PageTable,      POOL_TAG);
         ExFreePoolWithTag(g_Context, POOL_TAG);
@@ -259,7 +287,10 @@ VOID HyperRAM_Unload(_In_ PDRIVER_OBJECT DriverObject)
     if (g_Context->DeviceObject)
         IoDeleteDevice(g_Context->DeviceObject);
 
-    if (g_Context->SsdPoolBuffer)  ExFreePoolWithTag(g_Context->SsdPoolBuffer,  POOL_TAG);
+    if (g_Context->PoolFileHandle) {
+        ZwClose(g_Context->PoolFileHandle);
+        g_Context->PoolFileHandle = NULL;
+    }
     if (g_Context->RamCacheBuffer) ExFreePoolWithTag(g_Context->RamCacheBuffer, POOL_TAG);
     if (g_Context->PageTable)      ExFreePoolWithTag(g_Context->PageTable,      POOL_TAG);
 
@@ -309,28 +340,50 @@ VOID HyperRAM_PrefetchWorkItem(
     for (LONG d = 1; d <= depth; d++) {
         ULONG64 targetPageId = prefetchBaseId + d * stride;
         ULONG slot = (ULONG)(targetPageId % MAX_SSD_PAGES);
+        ULONG offset = 0;
+        BOOLEAN shouldPrefetch = FALSE;
 
         KeAcquireSpinLock(&g_Context->Lock, &oldIrql);
-
         // FIX C1: Only prefetch if the slot actually holds our target page.
         // FIX C4: Only promote if RAM cache is below capacity.
         if (g_Context->PageTable[slot].PageId   == targetPageId &&
             g_Context->PageTable[slot].InSsdPool                &&
            !g_Context->PageTable[slot].InRamCache               &&
             g_Context->RamCachePages < MAX_RAM_CACHE_PAGES) {
+            
+            offset = g_Context->PageTable[slot].OffsetInSsd;
+            shouldPrefetch = TRUE;
+        }
+        KeReleaseSpinLock(&g_Context->Lock, oldIrql);
 
-            PUCHAR src = (PUCHAR)g_Context->SsdPoolBuffer  + g_Context->PageTable[slot].OffsetInSsd;
+        if (shouldPrefetch) {
             PUCHAR dst = (PUCHAR)g_Context->RamCacheBuffer + (slot % MAX_RAM_CACHE_PAGES) * PAGE_SIZE;
 
-            RtlCopyMemory(dst, src, SSD_PAGE_SIZE);
-            RtlZeroMemory(dst + SSD_PAGE_SIZE, PAGE_SIZE - SSD_PAGE_SIZE);
-            g_Context->PageTable[slot].InRamCache = TRUE;
-            g_Context->RamCachePages++;
+            // Perform real file read from SSD pool file
+            IO_STATUS_BLOCK ioStatus;
+            LARGE_INTEGER byteOffset;
+            byteOffset.QuadPart = (LONGLONG)offset;
 
-            KeReleaseSpinLock(&g_Context->Lock, oldIrql);
-            WriteLog("[HyperRAM] Prefetch SUCCESS: page eagerly loaded to RAM.\r\n");
-        } else {
-            KeReleaseSpinLock(&g_Context->Lock, oldIrql);
+            NTSTATUS status = ZwReadFile(g_Context->PoolFileHandle, NULL, NULL, NULL,
+                                         &ioStatus, dst, SSD_PAGE_SIZE, &byteOffset, NULL);
+
+            if (NT_SUCCESS(status)) {
+                RtlZeroMemory(dst + SSD_PAGE_SIZE, PAGE_SIZE - SSD_PAGE_SIZE);
+
+                KeAcquireSpinLock(&g_Context->Lock, &oldIrql);
+                // Re-verify after releasing spin lock that target page hasn't changed/evicted
+                if (g_Context->PageTable[slot].PageId   == targetPageId &&
+                   !g_Context->PageTable[slot].InRamCache               &&
+                    g_Context->RamCachePages < MAX_RAM_CACHE_PAGES) {
+                    
+                    g_Context->PageTable[slot].InRamCache = TRUE;
+                    g_Context->RamCachePages++;
+                    WriteLog("[HyperRAM] Prefetch SUCCESS: page eagerly loaded to RAM from SSD file.\r\n");
+                }
+                KeReleaseSpinLock(&g_Context->Lock, oldIrql);
+            } else {
+                WriteLog("[HyperRAM] Prefetch failed to read from SSD pool file.\r\n");
+            }
         }
     }
 }
@@ -384,16 +437,20 @@ NTSTATUS HyperRAM_Read(
                 g_Context->NvmeReads++;
                 KeReleaseSpinLock(&g_Context->Lock, oldIrql);
 
-                // FIX C2 (documented): KeStallExecutionProcessor is a busy-wait
-                // that blocks this CPU core at DISPATCH_LEVEL for 50 µs.
-                // This simulates NVMe access latency for the prototype.
-                // A production driver would issue a real NVMe IRP and wait
-                // asynchronously; do NOT use KeStall in production.
-                KeStallExecutionProcessor(50);
+                // Perform real file read from SSD pool file (inherent NVMe hardware latency occurs naturally)
+                IO_STATUS_BLOCK ioStatus;
+                LARGE_INTEGER byteOffset;
+                byteOffset.QuadPart = (LONGLONG)ssdOffset;
 
-                PUCHAR src = (PUCHAR)g_Context->SsdPoolBuffer + ssdOffset;
-                RtlCopyMemory(buf, src, SSD_PAGE_SIZE);
-                RtlZeroMemory(buf + SSD_PAGE_SIZE, PAGE_SIZE - SSD_PAGE_SIZE);
+                status = ZwReadFile(g_Context->PoolFileHandle, NULL, NULL, NULL,
+                                    &ioStatus, buf, SSD_PAGE_SIZE, &byteOffset, NULL);
+
+                if (NT_SUCCESS(status)) {
+                    RtlZeroMemory(buf + SSD_PAGE_SIZE, PAGE_SIZE - SSD_PAGE_SIZE);
+                } else {
+                    WriteLog("[HyperRAM] Real-time READ from SSD pool file failed!\r\n");
+                    RtlZeroMemory(buf, PAGE_SIZE);
+                }
 
                 // Promote to RAM cache — only if we are under capacity.
                 // FIX C4: Guard RamCachePages against exceeding the buffer.
@@ -408,7 +465,7 @@ NTSTATUS HyperRAM_Read(
                     g_Context->RamCachePages++;
                 }
                 KeReleaseSpinLock(&g_Context->Lock, oldIrql);
-                WriteLog("[HyperRAM] READ: SSD miss, decompressed and promoted to RAM.\r\n");
+                WriteLog("[HyperRAM] READ: SSD miss, loaded from real SSD pool file and promoted to RAM.\r\n");
             }
 
             // --- TAU-BASED PREDICTIVE PREFETCHING ---
@@ -504,14 +561,26 @@ NTSTATUS HyperRAM_Write(
 
     if (length == PAGE_SIZE && Irp->AssociatedIrp.SystemBuffer) {
         PUCHAR  src    = (PUCHAR)Irp->AssociatedIrp.SystemBuffer;
-        PUCHAR  ssdDst = (PUCHAR)g_Context->SsdPoolBuffer + slot * SSD_PAGE_SIZE;
 
         KIRQL oldIrql;
         KeAcquireSpinLock(&g_Context->Lock, &oldIrql);
         g_Context->TotalWrites++;
         g_Context->NvmeWrites++;
-        RtlCopyMemory(ssdDst, src, SSD_PAGE_SIZE);  // mock 50% compress
+        KeReleaseSpinLock(&g_Context->Lock, oldIrql);
 
+        // Perform real file write to SSD pool file
+        IO_STATUS_BLOCK ioStatus;
+        LARGE_INTEGER byteOffset;
+        byteOffset.QuadPart = (LONGLONG)slot * SSD_PAGE_SIZE;
+
+        status = ZwWriteFile(g_Context->PoolFileHandle, NULL, NULL, NULL,
+                             &ioStatus, src, SSD_PAGE_SIZE, &byteOffset, NULL);
+
+        if (!NT_SUCCESS(status)) {
+            WriteLog("[HyperRAM] Real-time WRITE to SSD pool file failed!\r\n");
+        }
+
+        KeAcquireSpinLock(&g_Context->Lock, &oldIrql);
         // FIX C1: If this slot was occupied by a different page (hash collision),
         // clear the evicted page's RAM cache status before overwriting.
         if (g_Context->PageTable[slot].PageId != pageId &&
@@ -535,7 +604,7 @@ NTSTATUS HyperRAM_Write(
         g_Context->PageTable[slot].DataLength  = SSD_PAGE_SIZE;
         KeReleaseSpinLock(&g_Context->Lock, oldIrql);
 
-        WriteLog("[HyperRAM] WRITE: page compressed and stored in SSD pool.\r\n");
+        WriteLog("[HyperRAM] WRITE: page stored in real SSD pool file.\r\n");
         Irp->IoStatus.Information = length;
     } else {
         status = STATUS_INVALID_PARAMETER;
@@ -662,9 +731,20 @@ NTSTATUS HyperRAM_DeviceControl(
                     g_Context->NvmeReads++;
                     KeReleaseSpinLock(&g_Context->Lock, oldIrql);
 
-                    PUCHAR src = (PUCHAR)g_Context->SsdPoolBuffer + ssdOffset;
-                    RtlCopyMemory(outBuf, src, SSD_PAGE_SIZE);
-                    RtlZeroMemory(outBuf + SSD_PAGE_SIZE, PAGE_SIZE - SSD_PAGE_SIZE);
+                    // Perform real file read from SSD pool file
+                    IO_STATUS_BLOCK ioStatus;
+                    LARGE_INTEGER byteOffset;
+                    byteOffset.QuadPart = (LONGLONG)ssdOffset;
+
+                    status = ZwReadFile(g_Context->PoolFileHandle, NULL, NULL, NULL,
+                                        &ioStatus, outBuf, SSD_PAGE_SIZE, &byteOffset, NULL);
+
+                    if (NT_SUCCESS(status)) {
+                        RtlZeroMemory(outBuf + SSD_PAGE_SIZE, PAGE_SIZE - SSD_PAGE_SIZE);
+                    } else {
+                        WriteLog("[HyperRAM] IOCTL READ from SSD pool file failed!\r\n");
+                        RtlZeroMemory(outBuf, PAGE_SIZE);
+                    }
 
                     // Promote to RAM cache — FIX C4: enforce capacity limit.
                     PUCHAR ramDst = (PUCHAR)g_Context->RamCacheBuffer
@@ -705,14 +785,26 @@ NTSTATUS HyperRAM_DeviceControl(
             ULONG64 pageId = req->PageId;
             ULONG slot = (ULONG)(pageId % MAX_SSD_PAGES);
             PUCHAR srcData = (PUCHAR)buf + sizeof(HYPERRAM_PAGE_REQUEST);
-            PUCHAR ssdDst = (PUCHAR)g_Context->SsdPoolBuffer + slot * SSD_PAGE_SIZE;
 
             KIRQL oldIrql;
             KeAcquireSpinLock(&g_Context->Lock, &oldIrql);
             g_Context->TotalWrites++;
             g_Context->NvmeWrites++;
-            RtlCopyMemory(ssdDst, srcData, SSD_PAGE_SIZE); // mock 50% compress
+            KeReleaseSpinLock(&g_Context->Lock, oldIrql);
 
+            // Perform real file write to SSD pool file
+            IO_STATUS_BLOCK ioStatus;
+            LARGE_INTEGER byteOffset;
+            byteOffset.QuadPart = (LONGLONG)slot * SSD_PAGE_SIZE;
+
+            status = ZwWriteFile(g_Context->PoolFileHandle, NULL, NULL, NULL,
+                                 &ioStatus, srcData, SSD_PAGE_SIZE, &byteOffset, NULL);
+
+            if (!NT_SUCCESS(status)) {
+                WriteLog("[HyperRAM] IOCTL WRITE to SSD pool file failed!\r\n");
+            }
+
+            KeAcquireSpinLock(&g_Context->Lock, &oldIrql);
             // FIX C1: Clear displaced page's RAM flag when slot is reused.
             if (g_Context->PageTable[slot].PageId != pageId &&
                 g_Context->PageTable[slot].PageId != (ULONG64)-1 &&
@@ -734,7 +826,7 @@ NTSTATUS HyperRAM_DeviceControl(
             g_Context->PageTable[slot].DataLength = SSD_PAGE_SIZE;
             KeReleaseSpinLock(&g_Context->Lock, oldIrql);
 
-            WriteLog("[HyperRAM] IOCTL WRITE: page compressed and stored.\r\n");
+            WriteLog("[HyperRAM] IOCTL WRITE: page stored in real SSD pool file.\r\n");
             status = STATUS_SUCCESS;
         } else {
             status = STATUS_INVALID_PARAMETER;

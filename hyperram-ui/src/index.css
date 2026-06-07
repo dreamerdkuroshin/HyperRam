@@ -1,12 +1,16 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 
-@layer base {
-  body {
-    @apply bg-[#0a0a0a] text-white font-sans antialiased overflow-hidden;
-    margin: 0;
-  }
+@theme {
+  --font-sans: Inter, Roboto, sans-serif;
+}
+
+body {
+  background-color: #0a0a0a;
+  color: white;
+  font-family: var(--font-sans);
+  margin: 0;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
 }
 
 /* Custom animations for glassmorphism */

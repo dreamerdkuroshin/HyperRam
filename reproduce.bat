@@ -39,5 +39,13 @@ if %ERRORLEVEL% neq 0 (
 )
 
 echo.
+echo  Generating Fig 6 (architectural split / most important result)...
+"%PYTHON%" "%SCRIPT_DIR%\fig_architectural_comparison.py" --output-dir "%RESULTS%\figures"
+
+if %ERRORLEVEL% neq 0 (
+    echo  [WARN] fig_architectural_comparison.py failed - check Python deps
+)
+
+echo.
 echo  Done. Figures saved to: %RESULTS%\figures\
 echo  To embed in LaTeX:  \includegraphics{figures/figN_...png}

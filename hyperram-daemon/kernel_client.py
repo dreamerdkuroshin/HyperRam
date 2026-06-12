@@ -58,6 +58,7 @@ IOCTL_HYPERRAM_FLUSH       = _ctl(0x801, 2)   # 0x0022A004
 IOCTL_HYPERRAM_RESIZE_POOL = _ctl(0x802, 2)   # 0x0022A008
 IOCTL_HYPERRAM_READ_PAGE   = _ctl(0x803, 0)   # 0x0022200C
 IOCTL_HYPERRAM_WRITE_PAGE  = _ctl(0x804, 0)   # 0x00222010
+IOCTL_HYPERRAM_SAVE_METADATA = _ctl(0x805, 2) # 0x0022A014
 
 PAGE_SIZE = 4096
 
@@ -84,6 +85,10 @@ class HYPERRAM_STATS(ctypes.Structure):
         ("MaxRamCachePages", ctypes.c_uint32),
         ("PageSize",         ctypes.c_uint32),
         ("_pad",             ctypes.c_uint32),
+        ("TotalCompressedBytes", ctypes.c_uint64),
+        ("TotalUncompressedBytes", ctypes.c_uint64),
+        ("TotalCompressTimeUs", ctypes.c_uint64),
+        ("TotalDecompressTimeUs", ctypes.c_uint64),
     ]
 
     def to_dict(self):
@@ -106,6 +111,10 @@ class HYPERRAM_STATS(ctypes.Structure):
             "ram_cache_pages":    self.RamCachePages,
             "max_ram_pages":      self.MaxRamCachePages,
             "page_size":          self.PageSize,
+            "compressed_bytes":   self.TotalCompressedBytes,
+            "uncompressed_bytes": self.TotalUncompressedBytes,
+            "compress_time_us":   self.TotalCompressTimeUs,
+            "decompress_time_us": self.TotalDecompressTimeUs,
         }
 
     def __str__(self):
@@ -123,8 +132,10 @@ class HYPERRAM_STATS(ctypes.Structure):
             f"  Stride confidence : {d['stride_confidence']}/8  stride={d['last_stride']}",
             f"  RAM cache         : {d['ram_cache_pages']} / {d['max_ram_pages']} pages",
             f"  Prefetches fired  : {d['prefetches_fired']}",
-            f"  Pool size         : {d['pool_size_gb']:.2f} GB",
             f"  Pool used         : {d['pool_used_mb']:.2f} MB",
+            f"  Comp ratio        : {(d['uncompressed_bytes'] / d['compressed_bytes']) if d['compressed_bytes'] > 0 else 1.0:.2f}x",
+            f"  Comp CPU time     : {d['compress_time_us']} µs",
+            f"  Decomp CPU time   : {d['decompress_time_us']} µs",
             "  ────────────────────────────────────────────────────",
         ]
         return "\n".join(lines)
@@ -199,7 +210,7 @@ class HyperRAMKernelClient:
 
         in_ptr  = ctypes.cast(in_buf,  ctypes.c_void_p) if in_buf  else None
         in_sz   = len(in_buf) if in_buf else 0
-        out_buf = (ctypes.c_byte * out_size)() if out_size > 0 else None
+        out_buf = (ctypes.c_ubyte * out_size)() if out_size > 0 else None
         out_ptr = ctypes.cast(out_buf, ctypes.c_void_p) if out_buf else None
         returned = wt.DWORD(0)
 
@@ -257,6 +268,11 @@ class HyperRAMKernelClient:
         """Flush all dirty pages from RAM cache → NVMe pool."""
         if self._kernel:
             self._ioctl(IOCTL_HYPERRAM_FLUSH)
+
+    def save_metadata(self):
+        """Explicitly save metadata to pool file for persistent restart."""
+        if self._kernel:
+            self._ioctl(IOCTL_HYPERRAM_SAVE_METADATA)
 
     def resize_pool(self, new_gb: int):
         """Request the driver to resize the NVMe pool."""

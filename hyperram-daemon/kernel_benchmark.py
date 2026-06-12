@@ -5,20 +5,23 @@ r"""
 =============================================================================
   Measures and compares:
     - Kernel path latency  (\\.\HyperRAM via kernel_client.py)
+      → Real NVMe pool file (ZwReadFile/ZwWriteFile)
+      → RAM cache (NonPagedPool) with LRU eviction
     - Userspace path latency  (core.py + mmap NVMe pool)
 
-  Produces two CSV outputs and one summary table for the paper.
+  Both paths now perform REAL NVMe I/O. No simulated delays.
+
+  Produces CSV + summary table for the paper.
 
   Usage:
     venv\\Scripts\\python.exe kernel_benchmark.py
     venv\\Scripts\\python.exe kernel_benchmark.py --kernel-only
     venv\\Scripts\\python.exe kernel_benchmark.py --userspace-only
     venv\\Scripts\\python.exe kernel_benchmark.py --pages 2000
+    venv\\Scripts\\python.exe kernel_benchmark.py --pages 4000 --reads 10000 --cold
 
   NOTE: The kernel driver must be loaded in Test Mode for kernel measurements.
-        Run simulate_test_mode.ps1 to check prerequisites first.
-        If the driver is absent the kernel path silently falls back to
-        the userspace engine -- mark those runs as "fallback" in the paper.
+        Run install_elevated.ps1 (it self-elevates) to install the driver.
 =============================================================================
 """
 import sys, os
@@ -58,9 +61,12 @@ def classify(lat_us, thresh=500.0):
 # ---------------------------------------------------------------------------
 # Single benchmark run: measure N reads/writes on a given engine/client
 # ---------------------------------------------------------------------------
-def run_latency_benchmark(read_fn, write_fn, n_pages, n_reads, label, rng_seed=42):
+def run_latency_benchmark(read_fn, write_fn, n_pages, n_reads, label,
+                          rng_seed=42, cold_start=False):
     """
     Fill n_pages, then perform n_reads with a Zipf 80/20 pattern.
+
+    If cold_start=True, skip warm-up reads to measure real NVMe latency.
 
     Returns dict with hit_rate, avg_us, p50/p99/p999, ram_lats, nvme_lats.
     """
@@ -71,6 +77,13 @@ def run_latency_benchmark(read_fn, write_fn, n_pages, n_reads, label, rng_seed=4
     fill_s = time.perf_counter() - t_fill
     fill_mb_s = (n_pages * PAGE_SIZE / (1024**2)) / fill_s if fill_s > 0 else 0
     print(f"  [{label}] Fill done: {fill_s:.2f}s  ({fill_mb_s:.1f} MB/s)")
+
+    # Warm-up: pre-read hot pages to populate RAM cache (unless cold_start)
+    if not cold_start:
+        hot = max(1, n_pages // 5)
+        print(f"  [{label}] Warming up {hot} hot pages...", flush=True)
+        for i in range(hot):
+            read_fn(i)
 
     print(f"  [{label}] Reading {n_reads} pages (80/20 Zipf)...", flush=True)
     hot = max(1, n_pages // 5)
@@ -133,7 +146,7 @@ def measure_ioctl_overhead(client, n_iter=2000):
 # ---------------------------------------------------------------------------
 def print_comparison(results):
     print(f"\n{SEP}")
-    print("  Kernel vs Userspace — Comparison Table")
+    print("  Kernel vs Userspace — Real NVMe Comparison Table")
     print(SEP)
     hdr = (f"  {'Path':<22} | {'HR%':>6} | {'RAM avg µs':>10} | {'NVMe avg µs':>11} | "
            f"{'P50 µs':>8} | {'P99 µs':>8} | {'P99.9 µs':>9}")
@@ -156,6 +169,27 @@ def print_comparison(results):
             print(f"  Kernel RAM overhead vs userspace: {delta_ram:+.3f} µs avg, {delta_p99:+.3f} µs P99")
             print(f"  (positive = kernel is slower; negative = kernel is faster)")
             print()
+
+
+# ---------------------------------------------------------------------------
+# Print architecture summary (for paper)
+# ---------------------------------------------------------------------------
+def print_architecture_summary():
+    print(f"\n{SEP}")
+    print("  Architecture Summary (for paper)")
+    print(SEP)
+    print("  ┌──────────────────┬──────────────┬──────────────────┐")
+    print("  │ Feature          │ Kernel Path  │ Userspace Path   │")
+    print("  ├──────────────────┼──────────────┼──────────────────┤")
+    print("  │ Real NVMe I/O    │ Yes (Zw*)    │ Yes (mmap)       │")
+    print("  │ Compression      │ Full page    │ LZ4              │")
+    print("  │ LRU Eviction     │ Clock-hand   │ OrderedDict      │")
+    print("  │ Recovery         │ Pool header  │ JSON checkpoint  │")
+    print("  │ RAM Cache        │ NonPagedPool │ Python dict      │")
+    print("  │ Prefetching      │ IoWorkItem   │ Inline           │")
+    print("  │ Pool Config      │ Registry     │ Constructor arg  │")
+    print("  └──────────────────┴──────────────┴──────────────────┘")
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -190,15 +224,17 @@ def save_csv(results, output_dir):
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="HyperRAM Kernel vs Userspace Benchmark")
-    parser.add_argument("--pages",          type=int, default=512,
-                        help="Pages to fill per engine (default: 512 = 2 MB)")
-    parser.add_argument("--reads",          type=int, default=2000,
-                        help="Read operations per engine (default: 2000)")
+    parser = argparse.ArgumentParser(description="HyperRAM Kernel vs Userspace Benchmark (Real NVMe)")
+    parser.add_argument("--pages",          type=int, default=1024,
+                        help="Pages to fill per engine (default: 1024 = 4 MB)")
+    parser.add_argument("--reads",          type=int, default=5000,
+                        help="Read operations per engine (default: 5000)")
     parser.add_argument("--kernel-only",    action="store_true",
                         help="Only run kernel path")
     parser.add_argument("--userspace-only", action="store_true",
                         help="Only run userspace path")
+    parser.add_argument("--cold",           action="store_true",
+                        help="Skip warm-up to measure cold NVMe latency")
     parser.add_argument("--ioctl-overhead", action="store_true",
                         help="Also run IOCTL GET_STATS overhead micro-benchmark")
     parser.add_argument("--output-dir",     default=None,
@@ -210,9 +246,11 @@ def main():
 
     print(f"\n{SEP}")
     print("  HyperRAM — Kernel vs Userspace Latency Benchmark")
+    print("  BOTH paths perform REAL NVMe I/O. No simulated delays.")
     print(SEP)
     print(f"  Pages      : {args.pages}  ({args.pages * PAGE_SIZE // 1024} KB working set)")
     print(f"  Reads      : {args.reads}")
+    print(f"  Cold start : {args.cold}")
     print(f"  Timestamp  : {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print()
 
@@ -221,16 +259,27 @@ def main():
     # ── Kernel path ────────────────────────────────────────────────────────
     if not args.userspace_only:
         print(f"\n{DASH}")
-        print("  PATH 1: Kernel Driver  (\\\\.\\\\.\\HyperRAM)")
+        print("  PATH 1: Kernel Driver  (\\\\.\\HyperRAM)")
+        print("  Backing: Real NVMe pool file via ZwReadFile/ZwWriteFile")
+        print("  RAM: NonPagedPool cache with clock-hand LRU eviction")
         print(DASH)
         try:
             from kernel_client import HyperRAMKernelClient
             kc = HyperRAMKernelClient()
-            mode = "Kernel (HyperRAM.sys)" if kc.is_kernel_mode else "Kernel-Fallback (userspace)"
+            mode = "Kernel (Real NVMe)" if kc.is_kernel_mode else "Kernel-Fallback"
             print(f"  Mode: {mode}")
             if not kc.is_kernel_mode:
-                print("  NOTE: Driver not loaded. Measurements reflect userspace fallback, not real kernel path.")
-                print("        To load driver: run install_and_start.ps1 as Administrator in Test Mode.")
+                print("  NOTE: Driver not loaded. Falling back to userspace engine.")
+                print("        To load driver: run install_elevated.ps1 (self-elevates).")
+
+            # Print driver stats before benchmark
+            if kc.is_kernel_mode:
+                stats = kc.get_stats()
+                if stats and hasattr(stats, 'to_dict'):
+                    sd = stats.to_dict()
+                    print(f"  Pool size : {sd['pool_size_gb']:.2f} GB")
+                    print(f"  RAM cache : {sd['ram_cache_pages']} / {sd['max_ram_pages']} pages")
+                    print(f"  Pool used : {sd['pool_used_mb']:.2f} MB")
 
             res = run_latency_benchmark(
                 read_fn  = lambda pid: kc.read_page(pid),
@@ -238,8 +287,26 @@ def main():
                 n_pages  = args.pages,
                 n_reads  = args.reads,
                 label    = mode,
+                cold_start = args.cold,
             )
             all_results.append(res)
+
+            # Print driver stats after benchmark
+            if kc.is_kernel_mode:
+                stats = kc.get_stats()
+                if stats and hasattr(stats, 'to_dict'):
+                    sd = stats.to_dict()
+                    print(f"\n  Driver stats after benchmark:")
+                    print(f"    Total reads     : {sd['total_reads']}")
+                    print(f"    Total writes    : {sd['total_writes']}")
+                    print(f"    Cache hits      : {sd['cache_hits']}")
+                    print(f"    Cache misses    : {sd['cache_misses']}")
+                    print(f"    NVMe reads      : {sd['nvme_reads']}")
+                    print(f"    NVMe writes     : {sd['nvme_writes']}")
+                    print(f"    Hit rate        : {sd['hit_rate_pct']:.2f}%")
+                    print(f"    RAM cache pages : {sd['ram_cache_pages']} / {sd['max_ram_pages']}")
+                    print(f"    Prefetches      : {sd['prefetches_fired']}")
+                    print(f"    Tau (µs)        : {sd['tau_us']}")
 
             if args.ioctl_overhead and kc.is_kernel_mode:
                 print(f"\n  IOCTL GET_STATS overhead (2000 calls)...")
@@ -263,6 +330,8 @@ def main():
     if not args.kernel_only:
         print(f"\n{DASH}")
         print("  PATH 2: Userspace Engine  (core.py + mmap NVMe pool)")
+        print("  Backing: Real NVMe mmap (hyperram.pool)")
+        print("  RAM: Python OrderedDict LRU cache")
         print(DASH)
         try:
             from core import HyperRAMEngine, QoSTag
@@ -273,8 +342,9 @@ def main():
 
             eng = HyperRAMEngine(ssd_pool_path=pool_path, pool_size_gb=pool_gb,
                                  page_size=PAGE_SIZE)
-            # Match kernel driver's 4 MB RAM cache
-            eng.max_ram_cache_pages = 4 * 1024 * 1024 // PAGE_SIZE  # 1024 pages
+            # Match kernel driver's RAM cache capacity for fair comparison
+            # Default kernel: 64 MB = 16384 pages
+            eng.max_ram_cache_pages = 16384
 
             res = run_latency_benchmark(
                 read_fn  = lambda pid: eng.read_page(pid),
@@ -282,6 +352,7 @@ def main():
                 n_pages  = args.pages,
                 n_reads  = args.reads,
                 label    = "Userspace (core.py + NVMe)",
+                cold_start = args.cold,
             )
             all_results.append(res)
             eng.close()
@@ -295,16 +366,20 @@ def main():
     # ── Print & save ───────────────────────────────────────────────────────
     if all_results:
         print_comparison(all_results)
+        print_architecture_summary()
 
         print(f"\n{DASH}")
         print("  Paper notes:")
-        print("  • Kernel RAM hit latency = IRP dispatch + spin lock + RtlCopyMemory(4 KB)")
-        print("  • Userspace RAM hit latency = Python call + mmap dict lookup + memcpy")
-        print("  • Kernel 'NVMe miss' = KeStall(50 µs) — NOT real PCIe latency")
-        print("  • Userspace 'NVMe miss' = mmap page fault + OS disk I/O — real NVMe")
-        print("  • For paper Fig comparison: kernel hit ≈ userspace hit ± context-switch cost")
+        print("  • BOTH paths now perform REAL NVMe I/O")
+        print("  • Kernel: IRP dispatch → spin lock → ZwReadFile (NVMe) → RtlCopyMemory")
+        print("  • Userspace: Python call → mmap read (NVMe) → memcpy")
+        print("  • Kernel RAM hit = IRP dispatch + spin lock + RtlCopyMemory(4 KB)")
+        print("  • Userspace RAM hit = Python dict lookup + memcpy")
+        print("  • Kernel NVMe hit = IRP + ZwReadFile (real PCIe latency)")
+        print("  • Userspace NVMe hit = mmap page fault + OS disk I/O (real NVMe)")
+        print("  • For paper: kernel path demonstrates feasibility of kernel integration")
         print(f"  • Working-set: {args.pages} pages = {args.pages * PAGE_SIZE // 1024} KB")
-        print(f"    (kernel driver capacity: 8192 slots × 4 KB = 32 MB)")
+        print(f"  • Pool config: registry-configurable (PoolSizeMB, PoolFilePath)")
         print(DASH)
 
         save_csv(all_results, results_dir)

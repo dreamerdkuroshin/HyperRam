@@ -1,0 +1,5 @@
+venv/
+__pycache__/
+*.pyc
+hyperram.pool
+.env

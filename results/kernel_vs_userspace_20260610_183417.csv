@@ -1,0 +1,2 @@
+path,n_pages,n_reads,hit_rate_pct,ram_avg_us,nvme_avg_us,eff_us,fill_mb_s,p50_us,p90_us,p95_us,p99_us,p999_us
+Kernel (Real NVMe),2000,10000,46.0400,327.5711,819.1067,592.8038,13.86,567.0001,924.8001,1132.5001,1670.5000,4002.6000

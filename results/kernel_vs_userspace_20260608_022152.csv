@@ -1,0 +1,2 @@
+path,n_pages,n_reads,hit_rate_pct,ram_avg_us,nvme_avg_us,eff_us,fill_mb_s,p50_us,p90_us,p95_us,p99_us,p999_us
+Userspace (core.py + NVMe),1024,2000,100.0000,1.4592,N/A,1.4592,1486.38,1.0000,1.8000,2.0999,3.2999,55.3001

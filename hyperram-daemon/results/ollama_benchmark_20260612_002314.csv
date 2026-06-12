@@ -1,0 +1,2 @@
+model,display_name,params_gb,prompt_length,generated_length,tokens_generated,elapsed_sec,tokens_per_sec,ssd_reads,ssd_writes,cache_hits,cache_misses,hit_rate_pct,ram_pages_start,ram_pages_end,pool_used_mb_start,pool_used_mb_end,compression_ratio
+deepseek-r1:8b,DeepSeek R1 8B,8,42,0,0,0,0,0,0,0,0,0,0,0,0,0,1.0

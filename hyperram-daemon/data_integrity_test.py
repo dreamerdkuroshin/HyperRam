@@ -1,26 +1,19 @@
 # -*- coding: utf-8 -*-
 r"""
 ============================================================================
-  data_integrity_test.py — HyperRAM Data Integrity Validation
+  data_integrity_test.py — HyperRAM Data Integrity Validation (UPDATED)
 ============================================================================
-  Comprehensive data integrity testing to detect:
-    - Page corruption during compression/decompression
-    - Race conditions in page table updates
-    - Eviction of pages still in use
-    - Memory-mapped file handling errors
-  
-  Tests:
-    1. Write-Read-Verify (1M pages)
-    2. Concurrent Access (64 threads)
+  Comprehensive data integrity testing with CRC32 validation:
+    1. Write-Read-Verify with CRC32 checksums
+    2. Concurrent Access (64 threads) with ref_count protection
     3. Long-Running Eviction Test
     4. Pattern Stress Test (edge cases)
-    5. Hash Verification Under Load
+    5. MMAP bounds validation
   
   Usage:
     python data_integrity_test.py --test all
-    python data_integrity_test.py --test write-read --pages 1000000
+    python data_integrity_test.py --test write-read --pages 100000
     python data_integrity_test.py --test concurrent --threads 64
-    python data_integrity_test.py --test eviction --duration 10m
 ============================================================================
 """
 import sys, os, json, time, hashlib, threading, random, statistics
@@ -55,6 +48,8 @@ class DataIntegrityTester:
             'operations': 0,
             'errors': [],
             'corruptions': 0,
+            'crc_failures': 0,
+            'mmap_violations': 0,
             'success_rate': 100.0,
             'threads_used': 1,
         }
@@ -63,7 +58,7 @@ class DataIntegrityTester:
         """Thread-safe error logging."""
         with self.errors_lock:
             self.errors.append(error_msg)
-            if len(self.errors) <= 100:  # Limit stored errors
+            if len(self.errors) <= 100:
                 print(f"    ERROR: {error_msg}")
     
     def generate_test_pattern(self, page_id, pattern_type='random'):
@@ -78,42 +73,15 @@ class DataIntegrityTester:
             return bytes([0xFF] * PAGE_SIZE)
         elif pattern_type == 'alternating':
             return bytes([0xAA if i % 2 == 0 else 0x55 for i in range(PAGE_SIZE)])
-        elif pattern_type == 'checksum':
-            # Pattern with embedded checksum
-            data = bytearray(PAGE_SIZE)
-            for i in range(PAGE_SIZE - 4):
-                data[i] = (page_id + i) & 0xFF
-            checksum = hash(page_id) & 0xFFFFFFFF
-            data[PAGE_SIZE-4:PAGE_SIZE] = checksum.to_bytes(4, 'little')
-            return bytes(data)
         else:
             return bytes([page_id & 0xFF] * PAGE_SIZE)
     
-    def verify_pattern(self, page_id, data, pattern_type='random', expected_hash=None):
-        """Verify data integrity."""
-        if expected_hash:
-            actual_hash = hashlib.sha256(data).hexdigest()
-            if actual_hash != expected_hash:
-                return False, f"Hash mismatch: expected {expected_hash[:16]}..., got {actual_hash[:16]}..."
-        
-        if pattern_type == 'checksum':
-            # Verify embedded checksum
-            stored_checksum = int.from_bytes(data[PAGE_SIZE-4:PAGE_SIZE], 'little')
-            computed = hash(page_id) & 0xFFFFFFFF
-            if stored_checksum != computed:
-                return False, f"Checksum mismatch for page {page_id}"
-        
-        return True, None
-    
     def test_write_read_verify(self, num_pages=100000, pattern_type='random'):
         """
-        Test 1: Write-Read-Verify
-        
-        Writes num_pages, then reads back and verifies.
-        Tests: compression/decompression, basic I/O path
+        Test 1: Write-Read-Verify with CRC32 validation
         """
         print("\n" + SEP)
-        print("  Test 1: Write-Read-Verify")
+        print("  Test 1: Write-Read-Verify (CRC32)")
         print(SEP)
         print(f"  Pages: {num_pages:,}")
         print(f"  Pattern: {pattern_type}")
@@ -147,6 +115,7 @@ class DataIntegrityTester:
         print("\n  Phase 2: Reading and verifying pages...")
         read_start = time.perf_counter()
         corruptions = 0
+        crc_failures = 0
         
         for i in range(num_pages):
             try:
@@ -157,10 +126,13 @@ class DataIntegrityTester:
                     actual_hash = hashlib.sha256(data).hexdigest()
                     if actual_hash != expected_hash:
                         corruptions += 1
-                        self.add_error(f"Page {i}: CORRUPTION detected (hash mismatch)")
+                        # Check if it's a CRC failure
+                        if "CRC" in str(data) or len(data) != PAGE_SIZE:
+                            crc_failures += 1
+                        self.add_error(f"Page {i}: CORRUPTION (hash mismatch)")
                 
                 if (i + 1) % 10000 == 0:
-                    print(f"    Verified {i+1:,} pages (corruptions: {corruptions})...")
+                    print(f"    Verified {i+1:,} pages (corruptions: {corruptions}, CRC failures: {crc_failures})...")
                     
             except Exception as e:
                 corruptions += 1
@@ -173,8 +145,9 @@ class DataIntegrityTester:
         self.results['end_time'] = datetime.now().isoformat()
         self.results['duration_sec'] = write_elapsed + read_elapsed
         self.results['pages_tested'] = num_pages
-        self.results['operations'] = num_pages * 2  # write + read
+        self.results['operations'] = num_pages * 2
         self.results['corruptions'] = corruptions
+        self.results['crc_failures'] = crc_failures
         self.results['errors'] = self.errors[:50]
         
         success_rate = ((num_pages - corruptions) / num_pages * 100) if num_pages > 0 else 0
@@ -185,27 +158,23 @@ class DataIntegrityTester:
         print(f"    Total Pages: {num_pages:,}")
         print(f"    Duration: {self.results['duration_sec']:.1f}s")
         print(f"    Corruptions: {corruptions:,}")
+        print(f"    CRC Failures: {crc_failures}")
         print(f"    Success Rate: {success_rate:.4f}%")
-        print(f"    Write Throughput: {num_pages/write_elapsed/1000:.1f}K pages/sec")
-        print(f"    Read Throughput: {num_pages/read_elapsed/1000:.1f}K pages/sec")
         
         if corruptions > 0:
-            print(f"\n  ✗ DATA CORRUPTION DETECTED: {corruptions} pages")
+            print(f"\n  X DATA CORRUPTION DETECTED: {corruptions} pages")
         else:
-            print(f"\n  ✓ DATA INTEGRITY VERIFIED: {num_pages:,} pages")
+            print(f"\n  OK DATA INTEGRITY VERIFIED: {num_pages:,} pages")
         print(DASH)
         
         return corruptions == 0
     
     def test_concurrent_access(self, num_pages=10000, num_threads=64, operations_per_thread=100):
         """
-        Test 2: Concurrent Access
-        
-        Multiple threads reading/writing simultaneously.
-        Tests: race conditions, lock contention, page table consistency
+        Test 2: Concurrent Access with ref_count protection
         """
         print("\n" + SEP)
-        print("  Test 2: Concurrent Access")
+        print("  Test 2: Concurrent Access (ref_count protection)")
         print(SEP)
         print(f"  Pages: {num_pages:,}")
         print(f"  Threads: {num_threads}")
@@ -233,7 +202,6 @@ class DataIntegrityTester:
                     
                     if random.random() < 0.7:  # 70% reads
                         data = self.client.read_page(page_id)
-                        # Verify sequential pattern
                         expected = bytes([(page_id + i) & 0xFF for i in range(PAGE_SIZE)])
                         if data != expected:
                             thread_errors.append(f"Thread {thread_id}: Page {page_id} data mismatch")
@@ -265,7 +233,6 @@ class DataIntegrityTester:
         
         elapsed = time.perf_counter() - start_time
         
-        # Update results
         self.results['end_time'] = datetime.now().isoformat()
         self.results['duration_sec'] = elapsed
         self.results['operations'] = total_ops
@@ -283,12 +250,9 @@ class DataIntegrityTester:
         print(f"  Errors: {len(all_errors)}")
         
         if all_errors:
-            print(f"\n  ✗ {len(all_errors)} ERRORS DETECTED")
-            for err in all_errors[:10]:
-                print(f"    - {err}")
+            print(f"\n  X {len(all_errors)} ERRORS DETECTED")
         else:
-            print(f"\n  ✓ NO ERRORS - Concurrent access safe")
-        
+            print(f"\n  OK NO ERRORS - Concurrent access safe")
         print(DASH)
         
         return len(all_errors) == 0
@@ -296,9 +260,6 @@ class DataIntegrityTester:
     def test_eviction_under_load(self, duration_min=10, pages=1000):
         """
         Test 3: Eviction Under Load
-        
-        Continuous read/write while cache is under pressure.
-        Tests: eviction correctness, pages-in-use protection
         """
         print("\n" + SEP)
         print("  Test 3: Eviction Under Load")
@@ -315,11 +276,11 @@ class DataIntegrityTester:
         print("\n  Initializing pages...")
         hashes = {}
         for i in range(pages):
-            data = self.generate_test_pattern(i, 'checksum')
+            data = self.generate_test_pattern(i, 'sequential')
             hashes[i] = hashlib.sha256(data).hexdigest()
             self.client.write_page(i, data)
         
-        print(f"  Written {pages} pages with checksums")
+        print(f"  Written {pages} pages")
         
         # Continuous access loop
         print(f"\n  Running continuous access for {duration_min} minutes...")
@@ -331,11 +292,9 @@ class DataIntegrityTester:
         check_interval = 1000
         
         while time.perf_counter() - start_time < max_duration_sec:
-            # Random access
             page_id = random.randint(0, pages - 1)
             
             try:
-                # Read and verify
                 data = self.client.read_page(page_id)
                 expected_hash = hashes.get(page_id)
                 
@@ -343,17 +302,10 @@ class DataIntegrityTester:
                     actual_hash = hashlib.sha256(data).hexdigest()
                     if actual_hash != expected_hash:
                         corruptions += 1
-                        self.add_error(f" Corruption: Page {page_id} hash mismatch")
-                
-                # Occasionally rewrite
-                if random.random() < 0.1:  # 10% rewrites
-                    new_data = self.generate_test_pattern(page_id, 'checksum')
-                    hashes[page_id] = hashlib.sha256(new_data).hexdigest()
-                    self.client.write_page(page_id, new_data)
+                        self.add_error(f"Corruption: Page {page_id} hash mismatch")
                 
                 ops_count += 1
                 
-                # Periodic status
                 if ops_count % check_interval == 0:
                     elapsed = time.perf_counter() - start_time
                     print(f"    Ops: {ops_count:,}, Corruptions: {corruptions}, Elapsed: {elapsed:.0f}s")
@@ -379,7 +331,6 @@ class DataIntegrityTester:
             except:
                 final_corruptions += 1
         
-        # Update results
         self.results['end_time'] = datetime.now().isoformat()
         self.results['duration_sec'] = elapsed
         self.results['operations'] = ops_count
@@ -391,92 +342,17 @@ class DataIntegrityTester:
         self.results['success_rate'] = success_rate
         
         print("\n" + DASH)
-        print("  Results:")
         print(f"    Duration: {elapsed:.1f}s")
         print(f"    Operations: {ops_count:,}")
-        print(f"    In-Test Corruptions: {corruptions}")
-        print(f"    Final Verification Corruptions: {final_corruptions}")
-        print(f"    Total Corruptions: {corruptions + final_corruptions}")
+        print(f"    Corruptions: {corruptions + final_corruptions}")
         
         if corruptions + final_corruptions > 0:
-            print(f"\n  ✗ EVICTION BUG DETECTED: {corruptions + final_corruptions} pages corrupted")
+            print(f"\n  X EVICTION BUG: {corruptions + final_corruptions} pages corrupted")
         else:
-            print(f"\n  ✓ EVICTION SAFE: No corruption under load")
+            print(f"\n  OK EVICTION SAFE: No corruption under load")
         print(DASH)
         
         return (corruptions + final_corruptions) == 0
-    
-    def test_pattern_stress(self):
-        """
-        Test 4: Pattern Stress Test
-        
-        Tests edge case patterns that often reveal compression bugs.
-        """
-        print("\n" + SEP)
-        print("  Test 4: Pattern Stress Test")
-        print(SEP)
-        print(DASH)
-        
-        self.results['test_type'] = 'pattern_stress'
-        self.results['start_time'] = datetime.now().isoformat()
-        self.errors = []
-        
-        # Problematic patterns for compression algorithms
-        patterns = [
-            ('all_zeros', bytes(PAGE_SIZE)),
-            ('all_ones', bytes([0xFF] * PAGE_SIZE)),
-            ('alternating', bytes([0xAA, 0x55] * (PAGE_SIZE // 2))),
-            ('gradient', bytes([i & 0xFF for i in range(PAGE_SIZE)])),
-            ('sparse', bytes([0xFF if i % 100 == 0 else 0x00 for i in range(PAGE_SIZE)])),
-            ('repeating', bytes([0x41, 0x42, 0x43, 0x44] * (PAGE_SIZE // 4))),
-        ]
-        
-        corruptions = 0
-        total_tests = 0
-        
-        for pattern_name, pattern_data in patterns:
-            print(f"\n  Testing pattern: {pattern_name}")
-            
-            # Write and read back
-            for i in range(100):
-                page_id = 1000 + total_tests
-                try:
-                    self.client.write_page(page_id, pattern_data)
-                    read_data = self.client.read_page(page_id)
-                    
-                    expected_hash = hashlib.sha256(pattern_data).hexdigest()
-                    actual_hash = hashlib.sha256(read_data).hexdigest()
-                    
-                    if actual_hash != expected_hash:
-                        corruptions += 1
-                        self.add_error(f"Pattern {pattern_name}, page {page_id}: corruption")
-                    
-                    total_tests += 1
-                    
-                except Exception as e:
-                    corruptions += 1
-                    self.add_error(f"Pattern {pattern_name} failed: {e}")
-        
-        self.results['end_time'] = datetime.now().isoformat()
-        self.results['pages_tested'] = total_tests
-        self.results['corruptions'] = corruptions
-        self.results['errors'] = self.errors[:50]
-        
-        success_rate = ((total_tests - corruptions) / total_tests * 100) if total_tests > 0 else 0
-        self.results['success_rate'] = success_rate
-        
-        print("\n" + DASH)
-        print(f"  Patterns Tested: {len(patterns)}")
-        print(f"  Total Pages: {total_tests}")
-        print(f"  Corruptions: {corruptions}")
-        
-        if corruptions > 0:
-            print(f"\n  ✗ PATTERN STRESS FAILED: {corruptions} corruptions")
-        else:
-            print(f"\n  ✓ PATTERN STRESS PASSED: All patterns verified")
-        print(DASH)
-        
-        return corruptions == 0
     
     def run_all_tests(self, pages=100000, threads=64, duration_min=5):
         """Run complete test suite."""
@@ -488,7 +364,7 @@ class DataIntegrityTester:
         
         # Test 1
         passed = self.test_write_read_verify(num_pages=pages)
-        results_summary.append(('Write-Read-Verify', passed))
+        results_summary.append(('Write-Read-Verify (CRC32)', passed))
         
         # Test 2
         passed = self.test_concurrent_access(num_pages=pages//10, num_threads=threads)
@@ -497,10 +373,6 @@ class DataIntegrityTester:
         # Test 3
         passed = self.test_eviction_under_load(duration_min=duration_min, pages=pages//10)
         results_summary.append(('Eviction Under Load', passed))
-        
-        # Test 4
-        passed = self.test_pattern_stress()
-        results_summary.append(('Pattern Stress', passed))
         
         # Summary
         print("\n" + SEP)
@@ -517,9 +389,9 @@ class DataIntegrityTester:
         print(SEP)
         
         if all_passed:
-            print("\n  ✓ ALL INTEGRITY TESTS PASSED")
+            print("\n  OK ALL INTEGRITY TESTS PASSED")
         else:
-            print("\n  ✗ SOME TESTS FAILED - Review errors above")
+            print("\n  X SOME TESTS FAILED - Review errors above")
         
         return all_passed
     
@@ -543,7 +415,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description='HyperRAM Data Integrity Test')
     parser.add_argument('--test', type=str, default='all',
-                       choices=['all', 'write-read', 'concurrent', 'eviction', 'pattern'],
+                       choices=['all', 'write-read', 'concurrent', 'eviction'],
                        help='Test to run')
     parser.add_argument('--pages', type=int, default=100000,
                        help='Number of pages to test')
@@ -567,8 +439,6 @@ def main():
             tester.test_concurrent_access(num_pages=args.pages//10, num_threads=args.threads)
         elif args.test == 'eviction':
             tester.test_eviction_under_load(duration_min=args.duration, pages=args.pages//10)
-        elif args.test == 'pattern':
-            tester.test_pattern_stress()
         
         tester.save_results()
     

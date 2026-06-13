@@ -101,6 +101,15 @@ query
 queryex
 test_pool_size.py
 
+# ── Backup & Patch / Apply-fixes scripts ─────────────────────────────────────
+*.bak
+apply_fixes_step*.py
+quick_fixes.py
+core_read_page_fixed.py
+
+# ── Daemon results JSON (runtime data) ────────────────────────────────────────
+hyperram-daemon/results/*.json
+
 # ── VS Code ───────────────────────────────────────────────────────────────────
 .vscode/
 *.code-workspace

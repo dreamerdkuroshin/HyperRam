@@ -164,6 +164,27 @@ _k32.CloseHandle.restype  = wt.BOOL
 _k32.CloseHandle.argtypes = [ctypes.c_void_p]
 
 
+
+# Singleton fallback engine - reused across all client instances
+_fallback_engine_instance = None
+
+def _get_fallback_engine():
+    """Get or create singleton fallback engine."""
+    global _fallback_engine_instance
+    if _fallback_engine_instance is None:
+        from core import HyperRAMEngine
+        pool = os.path.join(os.path.dirname(__file__), "..", "hyperram.pool")
+        pool_abs = os.path.abspath(pool)
+        try:
+            _fallback_engine_instance = HyperRAMEngine(ssd_pool_path=pool_abs)
+            _fallback_engine_instance.max_ram_cache_pages = 256
+            # Try to load checkpoint if exists
+            _fallback_engine_instance.load_checkpoint()
+        except Exception as e:
+            print(f"[kernel_client] Failed to create fallback engine: {e}")
+            _fallback_engine_instance = None
+    return _fallback_engine_instance
+
 class HyperRAMKernelClient:
     r"""
     Userspace client for the HyperRAM kernel driver.
@@ -179,9 +200,10 @@ class HyperRAMKernelClient:
         """
         Args:
             fallback_engine: HyperRAMEngine instance to use if driver absent.
+                            If None, uses singleton fallback engine.
         """
         self._handle   = None
-        self._fallback = fallback_engine
+        self._fallback = fallback_engine if fallback_engine is not None else _get_fallback_engine()
         self._kernel   = False
         self._open()
 

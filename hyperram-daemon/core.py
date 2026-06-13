@@ -1,6 +1,8 @@
 import mmap
 import os
 import gc
+import zlib
+import time
 from collections import OrderedDict
 # pyrefly: ignore [missing-import]
 import lz4.block
@@ -15,6 +17,97 @@ class QoSTag:
     AI = "ai"             # Normal caching with prefetching
     DEFAULT = "default"
 
+
+class PageMetadata:
+    """Page metadata with atomic reference counting for thread safety."""
+    def __init__(self, page_id: int, qos_tag: str = QoSTag.DEFAULT):
+        self.page_id = page_id
+        self.qos_tag = qos_tag
+        self.is_in_ram = False
+        self.compressed_size = 0
+        self.ssd_offset = 0
+        self.original_size = 0
+        self.crc32 = 0
+        self.stored_size = 0
+        self.ref_count = 0
+        self.evicting = False
+        self.access_count = 0
+        self.last_access_time = time.perf_counter()
+    
+    def acquire(self):
+        """Acquire a reference to the page (prevents eviction)."""
+        self.ref_count += 1
+    
+    def release(self):
+        """Release a reference to the page."""
+        self.ref_count = max(0, self.ref_count - 1)
+    
+    def can_evict(self) -> bool:
+        """Check if page can be safely evicted."""
+        return self.ref_count == 0 and not self.evicting
+    
+    def update_access(self):
+        """Update access metadata."""
+        self.access_count += 1
+        self.last_access_time = time.perf_counter()
+
+
+class CompressedPage:
+    """Compressed page with CRC32 checksum for integrity verification."""
+    HEADER_SIZE = 16  # crc32(4) + compressed_size(4) + original_size(4) + flags(4)
+    
+    def __init__(self, data: bytes = None, compressed_data: bytes = None):
+        if data:
+            self.original_size = len(data)
+            self.compressed_data = lz4.block.compress(data, store_size=False)
+            self.compressed_size = len(self.compressed_data)
+            self.crc32 = zlib.crc32(data) & 0xFFFFFFFF
+        elif compressed_data:
+            self.compressed_data = compressed_data
+            self.compressed_size = len(compressed_data)
+            self.original_size = 0
+            self.crc32 = 0
+            
+    def to_bytes(self) -> bytes:
+        """Serialize compressed page with header."""
+        header = (
+            self.crc32.to_bytes(4, 'little') +
+            self.compressed_size.to_bytes(4, 'little') +
+            self.original_size.to_bytes(4, 'little') +
+            b'\x00\x00\x00\x00'  # flags (reserved)
+        )
+        return header + self.compressed_data
+        
+    @classmethod
+    def from_bytes(cls, data: bytes) -> 'CompressedPage':
+        """Deserialize compressed page from bytes."""
+        if len(data) < cls.HEADER_SIZE:
+            raise ValueError("Invalid compressed page: too small")
+        crc32 = int.from_bytes(data[0:4], 'little')
+        compressed_size = int.from_bytes(data[4:8], 'little')
+        original_size = int.from_bytes(data[8:12], 'little')
+        compressed_data = data[cls.HEADER_SIZE:cls.HEADER_SIZE + compressed_size]
+        page = cls(compressed_data=compressed_data)
+        page.crc32 = crc32
+        page.original_size = original_size
+        return page
+        
+    def decompress(self, expected_size: int = None) -> bytes:
+        """Decompress and verify CRC32."""
+        if self.original_size == 0 and expected_size:
+            self.original_size = expected_size
+        try:
+            if self.compressed_size == self.original_size:
+                data = self.compressed_data
+            else:
+                data = lz4.block.decompress(self.compressed_data, uncompressed_size=self.original_size)
+        except Exception as e:
+            raise ValueError(f"Decompression failed: {e}")
+        if zlib.crc32(data) & 0xFFFFFFFF != self.crc32:
+            raise ValueError(f"CRC32 mismatch: expected {self.crc32:08x}, got {zlib.crc32(data) & 0xFFFFFFFF:08x}")
+        return data
+
+
 class HyperRAMEngine:
     def __init__(self, ssd_pool_path: str = "hyperram.pool", pool_size_gb: int = 2, page_size: int = 4096):
         self.ssd_pool_path = ssd_pool_path
@@ -25,7 +118,7 @@ class HyperRAMEngine:
         self.lock = threading.RLock()
         
         # Virtual Page Table: maps page ID -> (is_in_ram, qos_tag, compressed_size, ssd_offset)
-        self.page_table: Dict[int, Tuple[bool, str, int, int]] = {}
+        self.page_table: Dict[int, PageMetadata] = {}
         self.offset_to_page: Dict[int, int] = {} # Reverse mapping: offset -> page_id
         # FIX Bug-4: Use OrderedDict for true LRU eviction (move_to_end on access)
         self.ram_cache: OrderedDict = OrderedDict()
@@ -40,6 +133,12 @@ class HyperRAMEngine:
         self.total_uncompressed_bytes = 0
         self.cache_hits = 0
         self.cache_misses = 0
+        self.corruption_count = 0
+        self.thrash_events = 0
+        self.thrashing_threshold = 100  # faults per second
+        self.fault_window = []  # (timestamp, fault_count)
+        self.thrashing_detected = False
+        self.adaptive_cache_enabled = True
         
         # QoS Traffic Counters
         self.qos_traffic = {
@@ -100,7 +199,7 @@ class HyperRAMEngine:
             if new_size < old_size:
                 stale_ids = []
                 for pid, (_, _, comp_sz, ssd_off) in self.page_table.items():
-                    if not self.page_table[pid][0] and ssd_off + comp_sz > self.pool_size_bytes:
+                    if not meta.is_in_ram and meta.ssd_offset + meta.stored_size > self.pool_size_bytes:
                         stale_ids.append(pid)
                 for pid in stale_ids:
                     del self.page_table[pid]
@@ -129,7 +228,14 @@ class HyperRAMEngine:
             # Store in RAM cache (LRU: move to end = most recently used)
             self.ram_cache[page_id] = data
             self.ram_cache.move_to_end(page_id)
-            self.page_table[page_id] = (True, qos_tag, 0, 0)
+            
+            # Create or update page metadata
+            if page_id not in self.page_table:
+                self.page_table[page_id] = PageMetadata(page_id, qos_tag)
+            meta = self.page_table[page_id]
+            meta.is_in_ram = True
+            meta.qos_tag = qos_tag
+            meta.update_access()
             
             # Aggressively spool shaders to SSD
             if qos_tag == QoSTag.SHADER:
@@ -142,11 +248,15 @@ class HyperRAMEngine:
             if page_id not in self.page_table:
                 return b'\0' * self.page_size
                 
-            is_in_ram, qos_tag, compressed_size, ssd_offset = self.page_table[page_id]
+            meta = self.page_table[page_id]
+            qos_tag = meta.qos_tag
             self.qos_traffic[qos_tag] += 1
+            
+            # Acquire reference to prevent eviction during read
+            meta.acquire()
 
-            # ---- TAU-BASED PREDICTIVE PREFETCHING (applied to ALL QoS tags including non-prefetchable) ----
-            now = self.time_module.perf_counter()
+            # ---- TAU-BASED PREDICTIVE PREFETCHING ----
+            now = time.perf_counter()
             if self.last_access_time is not None:
                 delta_t = now - self.last_access_time
                 self.inter_arrival_tau = 0.85 * self.inter_arrival_tau + 0.15 * delta_t
@@ -160,117 +270,156 @@ class HyperRAMEngine:
                 self.last_stride = current_stride
             self.last_page_id = page_id
 
+            # TEMPORARILY DISABLE PREFETCHING to prevent invalid reads
+            # Re-enable once metadata initialization is fixed
             prefetch_depth = 0
-            if self.stride_confidence >= 3 and self.last_stride != 0:
-                prefetch_depth = min(8, max(1, int(0.012 / (self.inter_arrival_tau + 1e-6))))
 
             for d in range(1, prefetch_depth + 1):
                 next_page = page_id + d * self.last_stride
                 if next_page in self.page_table:
-                    nxt_is_in_ram, nxt_qos, nxt_comp_sz, nxt_offset = self.page_table[next_page]
-                    if not nxt_is_in_ram and (nxt_offset + nxt_comp_sz) <= self.pool_size_bytes:
+                    nxt_meta = self.page_table[next_page]
+                    if not nxt_meta.is_in_ram and (nxt_meta.ssd_offset + nxt_meta.stored_size) <= self.pool_size_bytes:
                         self.ssd_reads += 1
-                        self.ssd_mmap.seek(nxt_offset)
-                        nxt_comp_data = self.ssd_mmap.read(nxt_comp_sz)
-                        if nxt_comp_sz == self.page_size:
-                            nxt_data = nxt_comp_data
-                        else:
-                            try:
-                                nxt_data = lz4.block.decompress(nxt_comp_data, uncompressed_size=self.page_size)
-                            except Exception:
-                                nxt_data = nxt_comp_data
-                        
-                        if len(self.ram_cache) >= self.max_ram_cache_pages:
-                            self._evict_page()
+                        self._prefetch_page_from_ssd(next_page, nxt_meta)
 
-                        self.ram_cache[next_page] = nxt_data
-                        self.ram_cache.move_to_end(next_page)  # LRU: prefetch goes to end
-                        self.page_table[next_page] = (True, nxt_qos, 0, 0)
-
-            if is_in_ram:
+            if meta.is_in_ram:
                 self.cache_hits += 1
                 data = self.ram_cache[page_id]
-                self.ram_cache.move_to_end(page_id)  # LRU: mark as recently used
+                self.ram_cache.move_to_end(page_id)
             else:
                 # Page is on SSD
                 self.cache_misses += 1
                 self.ssd_reads += 1
                 
+                # Check for thrashing
+                self._record_page_fault()
+                
                 # Prevent crash if pool was shrank and offset is now invalid
-                if ssd_offset + compressed_size > self.pool_size_bytes:
+                if meta.ssd_offset + meta.stored_size > self.pool_size_bytes:
+                    meta.release()
                     return b'\0' * self.page_size
                     
-                self.ssd_mmap.seek(ssd_offset)
-                compressed_data = self.ssd_mmap.read(compressed_size)
+                # MMAP bounds validation
+                if meta.ssd_offset < 0 or meta.ssd_offset + meta.stored_size > len(self.ssd_mmap):
+                    meta.release()
+                    raise ValueError(f"MMAP bounds violation: offset={meta.ssd_offset}, stored_size={meta.stored_size}, mmap_size={len(self.ssd_mmap)}")
+                    
+                self.ssd_mmap.seek(meta.ssd_offset)
+                # Read the full compressed page (header + data)
+                full_data = self.ssd_mmap.read(meta.stored_size)
                 
-                # Handle uncompressed fallback
-                if compressed_size == self.page_size:
-                    data = compressed_data
-                else:
-                    try:
-                        data = lz4.block.decompress(compressed_data, uncompressed_size=self.page_size)
-                    except Exception:
-                        data = compressed_data
+                # Decompress with CRC32 validation
+                try:
+                    comp_page = CompressedPage.from_bytes(full_data)
+                    data = comp_page.decompress(self.page_size)
+                except ValueError as e:
+                    self.corruption_count += 1
+                    print(f"[Core] CRC32 validation failed for page {page_id}: {e}")
+                    data = b'\0' * self.page_size
                 
-                # Textures remain on SSD (simulate streaming directly to GPU)
+                # Textures remain on SSD
                 if qos_tag == QoSTag.TEXTURE:
+                    meta.release()
                     return data
                     
-                # Promote to RAM cache (LRU: newly promoted pages go to end)
+                # Promote to RAM cache
                 if len(self.ram_cache) >= self.max_ram_cache_pages:
                     self._evict_page()
 
                 self.ram_cache[page_id] = data
                 self.ram_cache.move_to_end(page_id)
-                self.page_table[page_id] = (True, qos_tag, 0, 0)
+                meta.is_in_ram = True
+                meta.compressed_size = 0
+                meta.ssd_offset = 0
+                meta.update_access()
 
+            meta.release()
+            meta.update_access()
             return data
 
     def _force_evict(self, page_id: int):
         with self.lock:
             if page_id in self.ram_cache:
                 data = self.ram_cache.pop(page_id)
-                qos_tag = self.page_table[page_id][1]
-                self._write_to_ssd(page_id, data, qos_tag)
+                if page_id in self.page_table:
+                    meta = self.page_table[page_id]
+                    # Only evict if no active references
+                    if meta.can_evict():
+                        meta.evicting = True
+                        self._write_to_ssd(page_id, data, meta.qos_tag)
+                        meta.evicting = False
 
     def _evict_page(self):
         with self.lock:
             # FIX Bug-4 (LRU): evict the LEAST recently used non-pinned page.
             # FIX Bug-3: guard against an empty cache to avoid IndexError.
+            # FIX P0: Only evict pages with ref_count == 0
             if not self.ram_cache:
                 return
 
             evict_id = None
             # Iterate from oldest (front) to newest (back) — OrderedDict LRU order
             for pid in self.ram_cache:
-                qos_tag = self.page_table[pid][1]
-                if qos_tag not in [QoSTag.PHYSICS, QoSTag.STATE]:
+                if pid not in self.page_table:
+                    continue
+                meta = self.page_table[pid]
+                if meta.qos_tag not in [QoSTag.PHYSICS, QoSTag.STATE] and meta.can_evict():
                     evict_id = pid
                     break
 
             if evict_id is None:
-                # All pages are pinned — evict the absolute oldest as last resort
-                evict_id = next(iter(self.ram_cache))
+                # All pages are pinned or in-use — try to find any evictable page
+                for pid in self.ram_cache:
+                    if pid not in self.page_table:
+                        continue
+                    meta = self.page_table[pid]
+                    if meta.can_evict():
+                        evict_id = pid
+                        break
+                        
+            if evict_id is None:
+                # Cannot evict any page - thrashing risk
+                self.thrash_events += 1
+                return
 
             data = self.ram_cache.pop(evict_id)
-            qos_tag = self.page_table[evict_id][1]
-            self._write_to_ssd(evict_id, data, qos_tag)
+            if evict_id in self.page_table:
+                meta = self.page_table[evict_id]
+                meta.evicting = True
+                self._write_to_ssd(evict_id, data, meta.qos_tag)
+                meta.evicting = False
             
     def _write_to_ssd(self, page_id: int, data: bytes, qos_tag: str):
         with self.lock:
-            compressed_data = lz4.block.compress(data, store_size=False)
+            # Try to compress with CRC32
+            comp_page = CompressedPage(data)
+            total_size = CompressedPage.HEADER_SIZE + comp_page.compressed_size
             
-            # Enforce maximum boundary to prevent overwriting adjacent pages
-            if len(compressed_data) > self.page_size:
-                compressed_data = data
+            # If compressed data is larger than original or doesn't fit, store uncompressed
+            if comp_page.compressed_size >= len(data) or total_size > self.page_size:
+                # Store as uncompressed: set compressed_size = original_size
+                # This signals decompress() to skip LZ4 and just return raw data
+                comp_page.compressed_size = len(data)
+                comp_page.compressed_data = data
+                total_size = CompressedPage.HEADER_SIZE + len(data)
+            
+            compressed_data = comp_page.to_bytes()
                 
             self.total_uncompressed_bytes += len(data)
-            self.total_compressed_bytes += len(compressed_data)
+            self.total_compressed_bytes += total_size
             self.ssd_writes += 1
             
             # Prevent boundary crash if pool was shrank
             safe_page_id = page_id % self.max_pages 
-            ssd_offset = safe_page_id * self.page_size
+            # Use stride that accounts for header overhead to prevent overlap
+            # Max stored size = page_size + HEADER_SIZE (for uncompressed data)
+            stride = self.page_size + CompressedPage.HEADER_SIZE
+            ssd_offset = safe_page_id * stride
+            
+            # MMAP bounds validation
+            if ssd_offset + total_size > len(self.ssd_mmap):
+                print(f"[Core] WARNING: SSD offset {ssd_offset} + size {total_size} exceeds mmap bounds {len(self.ssd_mmap)}")
+                return
             
             # Reverse mapping: prevent page ID collision when offset wraps around
             if ssd_offset in self.offset_to_page:
@@ -281,7 +430,80 @@ class HyperRAMEngine:
             
             self.ssd_mmap.seek(ssd_offset)
             self.ssd_mmap.write(compressed_data)
-            self.page_table[page_id] = (False, qos_tag, len(compressed_data), ssd_offset)
+            
+            # Update metadata
+            if page_id in self.page_table:
+                meta = self.page_table[page_id]
+                meta.is_in_ram = False
+                meta.compressed_size = comp_page.compressed_size if total_size <= self.page_size else len(data)
+                meta.ssd_offset = ssd_offset
+                meta.original_size = len(data)
+                meta.crc32 = comp_page.crc32
+                meta.stored_size = total_size
+
+
+    def _prefetch_page_from_ssd(self, page_id: int, meta: PageMetadata):
+        """Prefetch a page from SSD into RAM cache."""
+        # MMAP bounds validation
+        if meta.ssd_offset < 0 or meta.stored_size <= 0 or meta.ssd_offset + meta.stored_size > len(self.ssd_mmap):
+            return
+        # Additional sanity check
+        if meta.stored_size > self.page_size * 2:  # Should never be larger than 2x page size
+            return
+            
+        self.ssd_mmap.seek(meta.ssd_offset)
+        # Read the full compressed page (header + data)
+        full_data = self.ssd_mmap.read(meta.stored_size)
+        
+        try:
+            comp_page = CompressedPage.from_bytes(full_data)
+            data = comp_page.decompress(self.page_size)
+        except ValueError as e:
+            self.corruption_count += 1
+            print(f"[Core] Prefetch CRC32 failed for page {page_id}: {e}")
+            return
+            
+        if len(self.ram_cache) >= self.max_ram_cache_pages:
+            self._evict_page()
+
+        self.ram_cache[page_id] = data
+        self.ram_cache.move_to_end(page_id)
+        meta.is_in_ram = True
+        meta.compressed_size = 0
+        meta.ssd_offset = 0
+        meta.update_access()
+        
+    def _record_page_fault(self):
+        """Record page fault for thrashing detection."""
+        now = time.perf_counter()
+        # Limit window size to prevent memory growth
+        if len(self.fault_window) > 1000:
+            self.fault_window = self.fault_window[-500:]  # Keep only last 500
+        self.fault_window.append((now, 1))
+        
+        # Remove old entries (older than 1 second)
+        self.fault_window = [(t, c) for t, c in self.fault_window if now - t < 1.0]
+        
+        # Check for thrashing
+        recent_faults = sum(c for t, c in self.fault_window)
+        if recent_faults > self.thrashing_threshold:
+            self.thrashing_detected = True
+            self.thrash_events += 1
+            # Adaptive response: increase cache size if possible
+            if self.adaptive_cache_enabled:
+                self._adapt_cache_size()
+        else:
+            self.thrashing_detected = False
+            
+    def _adapt_cache_size(self):
+        """Adaptively increase cache size when thrashing detected."""
+        # Increase cache by 25% if thrashing, but cap at reasonable limit
+        old_max = self.max_ram_cache_pages
+        new_max = min(int(old_max * 1.25), 10 * 1024 * 1024)  # Cap at 10M pages (~40GB)
+        if new_max <= old_max:
+            return  # Already at max
+        self.max_ram_cache_pages = new_max
+        print(f"[Core] Thrashing detected! Increased cache: {old_max} -> {new_max} pages")
 
     def get_metrics(self) -> dict:
         with self.lock:
@@ -292,7 +514,11 @@ class HyperRAMEngine:
             ssd_latency_ns = 25000 
             effective_latency_ns = (hit_rate/100 * ram_latency_ns) + ((100-hit_rate)/100 * ssd_latency_ns)
 
-            pinned_ram = sum(1 for pid in self.ram_cache if self.page_table[pid][1] in [QoSTag.PHYSICS, QoSTag.STATE])
+            pinned_ram = sum(1 for pid in self.ram_cache if self.page_table.get(pid) and self.page_table[pid].qos_tag in [QoSTag.PHYSICS, QoSTag.STATE])
+            
+            # Calculate fault rate for thrashing detection
+            now = time.perf_counter()
+            recent_faults = sum(1 for t, _ in self.fault_window if now - t < 1.0)
             
             return {
                 "ram_used_mb": (len(self.ram_cache) * self.page_size) / (1024 * 1024),
@@ -304,7 +530,11 @@ class HyperRAMEngine:
                 "ssd_reads": self.ssd_reads,
                 "effective_latency_ns": round(effective_latency_ns, 2),
                 "pinned_pages": pinned_ram,
-                "qos_traffic": self.qos_traffic
+                "qos_traffic": self.qos_traffic,
+                "corruption_count": self.corruption_count,
+                "thrashing_detected": self.thrashing_detected,
+                "thrash_events": self.thrash_events,
+                "page_faults_per_sec": recent_faults
             }
 
     def save_checkpoint(self, meta_path: str = None) -> str:
@@ -386,8 +616,25 @@ class HyperRAMEngine:
             restored = 0
             for pid_str, entry in meta["page_table"].items():
                 pid = int(pid_str)
-                is_in_ram, qos, comp_sz, ssd_off = entry
-                self.page_table[pid] = (False, qos, comp_sz, ssd_off)
+                # Handle both old tuple format and new dict format
+                if isinstance(entry, dict):
+                    is_in_ram = entry.get('is_in_ram', False)
+                    qos = entry.get('qos_tag', QoSTag.DEFAULT)
+                    comp_sz = entry.get('compressed_size', 0)
+                    ssd_off = entry.get('ssd_offset', 0)
+                    orig_sz = entry.get('original_size', self.page_size)
+                    crc = entry.get('crc32', 0)
+                else:
+                    is_in_ram, qos, comp_sz, ssd_off = entry
+                    orig_sz = self.page_size
+                    crc = 0
+                meta_obj = PageMetadata(pid, qos)
+                meta_obj.is_in_ram = is_in_ram
+                meta_obj.compressed_size = comp_sz
+                meta_obj.ssd_offset = ssd_off
+                meta_obj.original_size = orig_sz
+                meta_obj.crc32 = crc
+                self.page_table[pid] = meta_obj
                 self.offset_to_page[ssd_off] = pid
                 restored += 1
         return restored
